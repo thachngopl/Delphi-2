@@ -3,7 +3,10 @@ unit Execute.SChannel;
    SChannel for Delphi Tokyo (c)2018 Execute SARL
 }
 interface
-{$DEFINE LOG}
+{$IFDEF DEBUG}
+{.$DEFINE LOG}
+{.$DEFINE TRACE}
+{$ENDIF}
 {$POINTERMATH ON}
 uses
   Winapi.Windows,
@@ -23,11 +26,21 @@ type
     function ValidateElement(Element: PCERT_CHAIN_ELEMENT): Boolean; virtual;
   end;
 
+  TSSLValidAll = class(TSSLValidator)
+    function ValidateChain(Chain: PCCERT_CHAIN_CONTEXT; var Status: CERT_CHAIN_POLICY_STATUS): Boolean; override;
+    function ValidateElement(Element: PCERT_CHAIN_ELEMENT): Boolean; override;
+  end;
+
+  TCredentialsCallBack = procedure(SSL: Integer; UserData: Pointer);
+
 { Is SChannel available }
 function SSLAvailable: Boolean;
+procedure SSLShutdown;
 
 { Start a TLS connexion over a socket }
-function SSLStart(Socket: Integer; const Host: AnsiString = ''): Integer;
+function SSLStart(Socket: Integer; const Host: AnsiString = ''; Store: HCERTSTORE = 0): Integer;
+
+procedure SSLCredentialsCallBack(SSL: Integer; CallBack: TCredentialsCallBack; UserData: Pointer);
 
 { some data left ? }
 function SSLPending(SSL: Integer): Boolean;
@@ -41,9 +54,77 @@ function SSLClose(SSL: Integer): Integer;
 { If you wonder why the code is built like this, I have an Execute.OpenSSL unit that offers the same functions for OpenSSL }
 
 var
+  CertStatus: Cardinal;
   SSLError: string;
+  SSPError  : HRESULT;
+{$IFDEF TRACE}
+  TraceFile : string = 'TLS.txt';
+{$ENDIF}
 
 implementation
+
+{$IFDEF TRACE}
+const
+  HX: array[0..$F] of Char = '0123456789abcdef';
+
+var
+  Trace: TextFile;
+  TraceDump: Boolean;
+
+function T: string;
+begin
+  Result := FormatDateTime('[dd/mm/yyyy hh:nn] ', Now);
+end;
+
+function Ascii(Value: Byte): Char;
+begin
+  if (Value < 32) or (Value > 126) then
+    Result := '.'
+  else
+    Result := Char(Value);
+end;
+
+function Dump(var Data; Size: Integer): string;
+var
+  Line: string;
+  index: Integer;
+  Source: PByte;
+  Pad: Integer;
+begin
+  Result := '';
+  Source := @Data;
+  try
+    while Size > 0 do
+    begin
+      SetLength(Line, 3 * 16 + 1 + 16);
+      Line[3 * 15 + 4] := '`';
+      for Index := 0 to 15 do
+      begin
+        Line[3 * Index + 1] := HX[Source^ shr 4];
+        Line[3 * Index + 2] := HX[Source^ and $f];
+        Line[3 * Index + 3] := ' ';
+        Line[3 * 16 + 2 + Index] := Ascii(Source^);
+        Inc(Source);
+        Dec(Size);
+        if Size = 0 then
+        begin
+          for Pad := Index + 1 to 15 do
+          begin
+            Line[3 * Pad + 1] := '-';
+            Line[3 * Pad + 2] := '-';
+          end;
+          SetLength(Line, 3 * 16 + 2 + Index);
+          Break;
+        end;
+      end;
+      Result := Result + '                   ' + Line + #13#10;
+    end;
+  except
+    on e: Exception do
+      Result := Result + e.Message;
+  end;
+end;
+{$ENDIF}
 
 const
   IO_BUFFER_SIZE  = $10000;
@@ -126,6 +207,7 @@ begin
     Count := send(Socket, Data[Result], Size, 0);
     if Count <= 0 then
     begin
+      SSPError := 0;
       SSLError := 'send returns ' + IntToStr(WSAGetLastError);
       {$IFDEF LOG}WriteLn(SSLError);{$ENDIF}
       Exit(Count);
@@ -140,6 +222,12 @@ begin
   Result := True;
   if (Buffer.cbBuffer > 0) and (Buffer.pvBuffer <> nil) then
   begin
+  {$IFDEF TRACE}
+    WriteLn(Trace, T, 'Sending ', Buffer.cbBuffer, ' bytes');
+    if TraceDump then
+      WriteLn(Trace, Dump(Buffer.pvBuffer, Buffer.cbBuffer));
+    Flush(Trace);
+  {$ENDIF}
     if SendData(Socket, PByte(buffer.pvBuffer), Buffer.cbBuffer) <= 0 then
       Exit(False);
     SSPI.FreeContextBuffer(Buffer.pvBuffer);
@@ -153,10 +241,15 @@ type
   TSSLInfo = record
     Init       : TSSLInit;
     Error      : Cardinal;
+  // Credentials
+    CredentialsCallBack: TCredentialsCallBack;
+    UserData   : Pointer;
   // Connected socket
     Socket     : Integer;
   // Remote server name
     Servername : string;
+  // User specified certificat store
+     Store     : HCERTSTORE;
   // SChanel credentials
     SChannel   : SCHANNEL_CRED;
   // Credentials
@@ -196,9 +289,23 @@ var
 begin
   Result := False;
 
+   if Assigned(CredentialsCallBack) then
+  begin
+  {$IFDEF LOG}WriteLn('[SSL] CredentialsCallBack');{$ENDIF}
+    CertCloseStore(MyStore, 0);
+    CredentialsCallBack(Integer(@Self), UserData);
+    MyStore := CertOpenSystemStore(0, 'MY');
+    if MyStore = 0 then
+    begin
+      SSPError := 0;
+      SSLError := 'CertOpenSystemStore(0, ''MY'') returns 0';
+      Exit;
+    end;
+  end;
+
   FillChar(SChannel, SizeOf(SChannel), 0);
   SChannel.dwVersion := SCHANNEL_CRED_VERSION;
-  SChannel.grbitEnabledProtocols := SP_PROT_SSL3TLS1;//SP_PROT_TLS1;
+  SChannel.grbitEnabledProtocols := SP_PROT_TLS; // SP_PROT_TLS1_2;//SP_PROT_SSL3TLS1;//SP_PROT_TLS1;
   SChannel.dwFlags := SCH_CRED_NO_DEFAULT_CREDS or SCH_CRED_MANUAL_CRED_VALIDATION;
 
   Error := SSPI.AcquireCredentialsHandle(
@@ -212,9 +319,13 @@ begin
    @Credentials,
    nil
   );
-
+{$IFDEF TRACE}
+  WriteLn(Trace, T, 'AcquireCredentialsHandle returns 0x', IntToHex(Error, 8));
+  Flush(Trace);
+{$ENDIF}
   if Error <> SEC_E_OK then
   begin
+    SSPError := Error;
     SSLError := 'AcquireCredentialsHandle returns ' + IntToHex(Error, 8);
     Exit;
   end;
@@ -247,8 +358,14 @@ begin
     Flags,
     nil
   );
+{$IFDEF TRACE}
+  WriteLn(Trace, T, 'InitializeSecurityContext returns 0x', IntToHex(Error, 8), ' Context = 0x', IntToHex(Int64(Context),8));
+  Flush(Trace);
+{$ENDIF}
+
   if (Error <> SEC_I_CONTINUE_NEEDED) then
   begin
+    SSPError := Error;
     SSLError := 'First call to InitializeSecurityContext returns ' + IntToHex(Error, 8);
     Exit;
   end;
@@ -284,6 +401,8 @@ begin
   end;
   if iContext in Init then
   begin
+// détruit la session CPS quand on l'invoque dans un autre cas ?
+    if SSPError = HRESULT(SEC_E_ILLEGAL_MESSAGE) then
     SSPI.DeleteSecurityContext(@Context);
   end;
   Init := [];
@@ -293,9 +412,17 @@ function TSSLInfo.Read: Integer;
 begin
   Result := recv(Socket, RecvBuffer[RecvCount], Length(RecvBuffer) - RecvCount, 0);
   if Result > 0 then
-    Inc(RecvCount, Result)
-  else  begin
+  begin
+  {$IFDEF TRACE}
+    WriteLn(Trace, T, 'Receiving ', RecvCount, ' bytes');
+    if TraceDump then
+      WriteLn(Trace, Dump(RecvBuffer[RecvCount], Result));
+    Flush(Trace);
+  {$ENDIF}
+    Inc(RecvCount, Result);
+  end else  begin
     Error := WSAGetLastError;
+    SSPError := 0;
     SSLError := 'recv returns ' + IntToHex(Error, 8);
   end;
 end;
@@ -304,7 +431,6 @@ function TSSLInfo.Readable: Integer;
 var
   Buffers: array[0..3] of TSecBuffer;
   Buffer : TSecBufferDesc;
-  Count  : Integer;
   Index  : Integer;
 begin
   Result := DataCount - DataStart;
@@ -349,6 +475,7 @@ begin
       // Session expires
       if Error = SEC_I_CONTEXT_EXPIRED then
       begin
+        SSPError := Error;
         SSLError := 'DecryptMessage returns SEC_I_CONTEXT_EXPIRED';
       {$IFDEF LOG}WriteLn(SSLError);{$ENDIF}
         Exit(-1);
@@ -361,9 +488,9 @@ begin
           // Decrypted data
           SECBUFFER_DATA:
           begin
-            if DataCount + Buffers[Index].cbBuffer > Length(DataBuffer) then
+            if DataCount + Integer(Buffers[Index].cbBuffer) > Length(DataBuffer) then
             begin
-              SetLength(DataBuffer, DataCount + Buffers[Index].cbBuffer);
+              SetLength(DataBuffer, DataCount + Integer(Buffers[Index].cbBuffer));
             end;
            {$IFDEF LOG}WriteLn('Decrypt ',Buffers[Index].cbBuffer,' bytes ');{$ENDIF}
             Move(Buffers[Index].pvBuffer^, DataBuffer[DataCount], Buffers[Index].cbBuffer);
@@ -372,7 +499,7 @@ begin
           // Extra data
           SECBUFFER_EXTRA:
           begin
-            Assert(Buffers[Index].cbBuffer <= Length(RecvBuffer));
+            Assert(Integer(Buffers[Index].cbBuffer) <= Length(RecvBuffer));
             RecvCount := Buffers[Index].cbBuffer;
             Move(Buffers[Index].pvBuffer^, RecvBuffer[0], RecvCount);
           end;
@@ -458,6 +585,10 @@ begin
       Flags,
       nil
     );
+  {$IFDEF TRACE}
+    WriteLn(Trace, T, 'InitializeSecurityContext returns 0x', IntToHex(Error, 8));
+    Flush(Trace);
+  {$ENDIF}
 
     {$IFDEF LOG}
     WriteLn('Error = ', Error, ' / 0x', IntToHex(Error, 8), ', Output = ', OutBuffers[0].cbBuffer, ', InputLeft = ', InBuffers[1].cbBuffer);
@@ -473,7 +604,7 @@ begin
     if (InBuffers[1].cbBuffer > 0) and (InBuffers[1].BufferType = SECBUFFER_EXTRA) then
     begin
      {$IFDEF LOG}WriteLn('[SSL] ReadLoop.SECBUFFER_EXTRA');{$ENDIF}
-      Source := @RecvBuffer[RecvCount - InBuffers[1].cbBuffer];
+      Source := @RecvBuffer[RecvCount - Integer(InBuffers[1].cbBuffer)];
       RecvCount := InBuffers[1].cbBuffer;
      {$IFDEF LOG}WriteLn('[SSL] ReadLoop.Move(InBuffer, RecvBufer, ', RecvCount, ')');{$ENDIF}
       Move(Source^, RecvBuffer[0], RecvCount);
@@ -502,6 +633,7 @@ begin
     if FAILED(Error) then
     begin
      {$IFDEF LOG}WriteLn('[SSL] ReadLoop.FAILED');{$ENDIF}
+      SSPError := Error;
       SSLError := 'InitializeSecurityContext returns ' + IntToHex(Error, 8);
       Exit(-1);
     end;
@@ -509,6 +641,7 @@ begin
 
   until Error = SEC_E_OK;
   {$IFDEF LOG}WriteLn('[SSL] ReadLoop.OK');{$ENDIF}
+  Result := 0;
 end;
 
 function TSSLInfo.GetClientCredentials: Boolean;
@@ -521,16 +654,37 @@ var
   ElementIndex: DWORD;
   pCertContext: PCCERT_CONTEXT;
   Creds: TCredHandle;
+  LStore: Integer;
 begin
+  if Assigned(CredentialsCallBack) then
+  begin
+  {$IFDEF LOG}WriteLn('[SSL] CredentialsCallBack');{$ENDIF}
+//    CertCloseStore(MyStore, 0);
+    CredentialsCallBack(Integer(@Self), UserData);
+//    MyStore := CertOpenSystemStore(0, 'MY');
+//    if MyStore = 0 then
+//    begin
+//      SSLError := 'CertOpenSystemStore(0, ''MY'') returns 0';
+//      Exit(False);
+//    end;
+  end;
 {$IFDEF LOG}WriteLn('[SSL] GetClientCredentials');{$ENDIF}
   FillChar(Issuer, SizeOf(Issuer), 0);
   Error := SSPI.QueryContextAttributes(@Context, SECPKG_ATTR_ISSUER_LIST_EX, @Issuer);
   if Error <> SEC_E_OK then
   begin
+    SSPError := Error;
     SSLError := 'QueryContextAttributes(SECPKG_ATTR_ISSUER_LIST_EX) returns ' + IntToHex(Error, 8);
+   {$IFDEF LOG}WriteLn('[SSL] ', SSLError);{$ENDIF}
     Exit(False);
   end;
-
+{$IFDEF LOG}
+  WriteLn('[SSL] QueryContextAttributes returns 0x', IntToHex(Error, 8));
+{$ENDIF}
+{$IFDEF TRACE}
+  WriteLn(Trace, T, 'QueryContextAttributes returns 0x', IntToHex(Error, 8));
+  Flush(Trace);
+{$ENDIF}
   FillChar(ChainPara, SizeOf(ChainPara), 0);
   ChainPara.cbSize := SizeOf(ChainPara);
   ChainPara.pszUsageIdentifier := szOID_PKIX_KP_CLIENT_AUTH;
@@ -541,10 +695,15 @@ begin
   ChainIndex := 0;
   ElementIndex := 0;
 
+  if Store = 0 then
+    LStore := MyStore
+  else
+    LStore := Store;
+
   ChainCtxt := nil;
   repeat
     ChainCtxt := CertFindChainInStore(
-      MyStore,
+      LStore,
       X509_ASN_ENCODING,
       0,
       CERT_CHAIN_FIND_BY_ISSUER,
@@ -553,9 +712,17 @@ begin
     );
     if ChainCtxt = nil then
     begin
+      SSPError := 0;
       SSLError := 'CertFindChainInStore returns nil';
+    {$IFDEF LOG}
+      WriteLn('[SSL] ', SSLError);
+    {$ENDIF}
       Exit(False);
     end;
+{$IFDEF TRACE}
+  WriteLn(Trace, T, 'calling CertFindChainInStore(szOID_PKIX_KP_CLIENT_AUTH) for ', CertName(ChainCtxt.rgpChain[0].rgpElement[0].pCertContext, Issuer.aIssuers^));
+  Flush(Trace);
+{$ENDIF}
 
     pCertContext := ChainCtxt.rgpChain[0].rgpElement[0].pCertContext;
     SChannel.dwVersion := SCHANNEL_CRED_VERSION;
@@ -573,10 +740,18 @@ begin
      @Creds,
       nil
     );
+  {$IFDEF LOG}
+    WriteLn('[SSL] AcquireCredentialsHandle returns 0x', IntToHex(Error, 8));
+  {$ENDIF}
+  {$IFDEF TRACE}
+    WriteLn(Trace, T, 'AcquireCredentialsHandle returns 0x', IntToHex(Error, 8));
+    Flush(Trace);
+  {$ENDIF}
   until Error = SEC_E_OK;
 {$IFDEF LOG}WriteLn('[SSL] GetClientCredentials.NewCredentiels');{$ENDIF}
   SSPI.FreeCredentialsHandle(@Credentials);
   Credentials := Creds;
+  Result := True;
 end;
 
 function TSSLInfo.VerifyServer: Boolean;
@@ -597,8 +772,13 @@ var
 begin
   Server := nil;
   Error := SSPI.QueryContextAttributes(@Context, SECPKG_ATTR_REMOTE_CERT_CONTEXT, @Server);
+{$IFDEF TRACE}
+  WriteLn(Trace, T, 'QueryContextAttributes returns 0x', IntToHex(Error, 8));
+  Flush(Trace);
+{$ENDIF}
   if Error <> 0 then
   begin
+    SSPError := Error;
     SSLError := 'QueryCredentialsAttributes returns ' + IntToHex(Error, 8);
     Exit(False);
   end;
@@ -619,6 +799,10 @@ begin
     nil,
     Chain
   );
+{$IFDEF TRACE}
+  WriteLn(Trace, T, 'CertGetCertificateChain returns ', Result);
+  Flush(Trace);
+{$ENDIF}
 
   if Result then
   begin
@@ -641,15 +825,27 @@ begin
       Chain,
       Policy,
       Status);
+  {$IFDEF TRACE}
+    WriteLn(Trace, T, 'CertVerifyCertificateChainPolicy returns ', Result);
+    Flush(Trace);
+  {$ENDIF}
 
     if Result then
     begin
+    {$IFDEF TRACE}
+      WriteLn(Trace, T, 'CertVerifyCertificateChainPolicy, Status.dwError = 0x', IntToHex(Status.dwError, 8));
+      Flush(Trace);
+    {$ENDIF}
+      CertStatus := Status.dwError;
       if Status.dwError = CERT_E_UNTRUSTEDROOT then
         Result := Validate(Chain, Status)
       else
         Result := Status.dwError = 0;
       if Result = False then
+      begin
+        SSPError := Status.dwError;
         SSLError := 'CertVerifyCertificateChainPolicy.Status = ' + IntToHex(Status.dwError, 8);// 800B0109
+    end;
     end;
 
     CertFreeCertificateChain(Chain);
@@ -665,6 +861,7 @@ begin
   Error := SSPI.QueryContextAttributes(@Context, SECPKG_ATTR_STREAM_SIZES, @BuffSizes);
   if Error <> SEC_E_OK then
   begin
+    SSPError := Error;
     SSLError := 'QueryContextAttributes(SECPKG_ATTR_STREAM_SIZES) returns ' + IntToHex(Error, 8);
     Exit(False);
   end;
@@ -699,7 +896,7 @@ begin
   Source := @Data;
   while Size > 0 do
   begin
-    if Size > BuffSizes.cbMaximumMessage then
+    if Cardinal(Size) > BuffSizes.cbMaximumMessage then
       Count := BuffSizes.cbMaximumMessage
     else
       Count := Size;
@@ -717,7 +914,7 @@ begin
 
     Buffers[2].cbBuffer := BuffSizes.cbTrailer;
     Buffers[2].BufferType := SECBUFFER_STREAM_TRAILER;
-    Buffers[2].pvBuffer := @SendBuffer[BuffSizes.cbHeader + Count];
+    Buffers[2].pvBuffer := @SendBuffer[Integer(BuffSizes.cbHeader) + Count];
 
     Buffers[3].BufferType := SECBUFFER_EMPTY;
 
@@ -728,6 +925,7 @@ begin
     Error := SSPI.EncryptMessage(@Context, 0, @Buffer, 0);
     if FAILED(Error) then
     begin
+      SSPError := Error;
       SSLError := 'EncryptMessage returns ' + IntToHex(Error, 8);
     {$IFDEF LOG}WriteLn(SSLError);{$ENDIF}
       Exit(-1);
@@ -739,16 +937,31 @@ begin
   end;
 end;
 
+var
+  secur32: THandle;
 
 function SSLAvailable: Boolean;
+var
+  init: function: PSecurityFunctionTable; stdcall;
 begin
   Result := Initialized;
+  SSPError := 0;
   if not Initialized then
   begin
    {$IFDEF LOG}WriteLn('SSLAvailable');{$ENDIF}
     Initialized := True;
 
-    SSPI := InitSecurityInterface();
+   // NB: il n'est pas possible de déinitialiser SSPI, il faut décharger la DLL pour se faire
+    secur32 := LoadLibrary('secur32.dll');
+    @init := GetProcAddress(secur32, 'InitSecurityInterfaceW');
+
+    if @init = nil then
+    begin
+      SSLError := 'InitSecurityInterface() not found';
+      Exit;
+    end;
+
+    SSPI := init();//InitSecurityInterface();
     if SSPI = nil then
     begin
       SSLError := 'InitSecurityInterface() returns nil';
@@ -766,29 +979,70 @@ begin
   end;
 end;
 
-function SSLStart(Socket: Integer; const Host: AnsiString = ''): Integer;
+procedure SSLShutdown;
+begin
+  if Initialized then
+  begin
+    FreeLibrary(secur32);
+    secur32 := 0;
+    Initialized := False;
+  end;
+end;
+
+function SSLStart(Socket: Integer; const Host: AnsiString = ''; Store: HCERTSTORE = 0): Integer;
 var
   Info: PSSLInfo;
 begin
+{$IFDEF TRACE}
+  AssignFile(Trace, TraceFile);
+{$I-}
+  Append(Trace);
+  if IoResult <> 0 then
+    Rewrite(Trace);
+  WriteLn(Trace, T, 'StartSSL on socket ' , Socket, ' for host ', Host);
+  Flush(Trace);
+  TraceDump := True;
+{$ENDIF}
   Result := 0;
+  CertStatus := 0;
+  SSPError := 0;
+  SSLError := '';
 
   if SSLAvailable = False then
   begin
+  {$IFDEF DEBUG}WriteLn('SSL not available');{$ENDIF}
     Exit;
   end;
 
   New(Info);
-  Info.Init := [];
+  FillChar(Info^, SizeOf(TSSLInfo), 0);
   Info.Socket := Socket;
-  Info.Servername := Host;
+  Info.Servername := string(Host);
+  Info.Store := Store;
   if not Info.Start then
   begin
     Info.Clean;
     Dispose(Info);
+    if (SSPError = HRESULT(SEC_E_ILLEGAL_MESSAGE))
+    or (SSPError = HRESULT(SEC_E_INTERNAL_ERROR)) then
+      SSLShutdown;
     Exit;
   end;
-
+{$IFDEF TRACE}
+  TraceDump := False;
+{$ENDIF}
   Result := Integer(Info);
+end;
+
+procedure SSLCredentialsCallBack(SSL: Integer; CallBack: TCredentialsCallBack; UserData: Pointer);
+var
+  Info: PSSLInfo absolute SSL;
+begin
+  if SSL <> 0 then
+  begin
+    Info.CredentialsCallBack := CallBack;
+    Info.UserData := UserData;
+  end;
 end;
 
 function SSLConnect(SSL: Integer): Boolean;
@@ -827,10 +1081,28 @@ function SSLClose(SSL: Integer): Integer;
 var
   Info: PSSLInfo absolute SSL;
 begin
+  Result := 0;
   if SSL = 0 then
     Exit;
+{$IFDEF TRACE}
+  WriteLn(Trace, '-------------');
+  CloseFile(Trace);
+{$ENDIF}
   Info.Clean;
   Dispose(Info);
+end;
+
+{ TSSLValidAll }
+
+function TSSLValidAll.ValidateChain(Chain: PCCERT_CHAIN_CONTEXT;
+  var Status: CERT_CHAIN_POLICY_STATUS): Boolean;
+begin
+  Result := True;
+end;
+
+function TSSLValidAll.ValidateElement(Element: PCERT_CHAIN_ELEMENT): Boolean;
+begin
+  Result := True;
 end;
 
 initialization
